@@ -538,7 +538,7 @@ int main(int argc, char* argv[])
     //Usage is correct - fix the given image
     if(!writeForm2EDC)
     {
-        printf("Writing of optional EDC for mode 2 form 2 sectors disabled!");
+        printf("Writing of optional EDC for mode 2 form 2 sectors disabled!\n");
     }
     printf("Fixing image...\n");
     int errorcode = fixImage(inputfile, outputfile, writeForm2EDC);
