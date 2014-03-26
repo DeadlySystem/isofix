@@ -172,7 +172,7 @@ struct fixImageStatus fixImage(char* inputfilepath, char* outputfilepath, enum E
 
     if(form2EDCMode == INFER)
     {
-        //If the EDC mode is to be infered, do so by looking at the bootloader
+        //If the EDC mode is to be inferred, do so by looking at the bootloader
 
         //Allocate memory to hold bootloader
         unsigned char* bootloader = (unsigned char*) malloc(BOOTLOADER_SIZE);
