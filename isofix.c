@@ -5,6 +5,8 @@
 
 //Position and size of individual elements in a CD sector
 #define SECTOR_SIZE                    2352
+#define BOOTLOADER_SECTORS             16
+#define BOOTLOADER_SIZE                (BOOTLOADER_SECTORS * SECTOR_SIZE)
 #define SYNC_SIZE                      12
 #define HEADER_OFFSET                  SYNC_SIZE
 #define HEADER_SIZE                    4
@@ -107,17 +109,48 @@ unsigned short RSPCTable[43][256] =
 #define ERROR_UNSUPPORTED_MODE  6
 #define ERROR_SUBHEADER_DAMAGED 7
 #define ERROR_MODE0_IS_NOT_0    8
-int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
+
+enum EDCMode
 {
+    INFER = 0,
+    KEEP,
+    COMPUTE,
+    ZERO
+};
+
+struct fixImageStatus
+{
+    int  errorcode;
+    int  mode0sectors;
+    int  mode1sectors;
+    int  mode2form1sectors;
+    int  mode2form2sectors;
+    int  form2bootsectorswithedc;
+    int  form2bootsectorswithoutedc;
+};
+
+struct fixImageStatus fixImage(char* inputfilepath, char* outputfilepath, enum EDCMode form2EDCMode, bool verbose)
+{
+    //Initialize return value struct
+    struct fixImageStatus status;
+    status.errorcode                  = 0;
+    status.mode0sectors               = 0;
+    status.mode1sectors               = 0;
+    status.mode2form1sectors          = 0;
+    status.mode2form2sectors          = 0;
+    status.form2bootsectorswithedc    = 0;
+    status.form2bootsectorswithoutedc = 0;
+
     //Sync pattern
     unsigned char sync[SYNC_SIZE] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
 
     //Open the input file
     FILE* inputfile;
-    inputfile  = fopen(inputfilepath, "r+b");
+    inputfile = fopen(inputfilepath, "rb");
     if(inputfile == NULL)
     {
-        return ERROR_INPUT_IO_ERROR;
+        status.errorcode = ERROR_INPUT_IO_ERROR;
+        return status;
     }
 
     //Open the output file
@@ -128,7 +161,8 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
         //Close the input file
         fclose(inputfile);
 
-        return ERROR_OUTPUT_IO_ERROR;
+        status.errorcode = ERROR_OUTPUT_IO_ERROR;
+        return status;
     }
 
     //Determine file size
@@ -136,14 +170,74 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
     int filesize = ftell(inputfile);
     fseek(inputfile, 0, SEEK_SET);
 
+    if(form2EDCMode == INFER)
+    {
+        //If the EDC mode is to be infered, do so by looking at the bootloader
+
+        //Allocate memory to hold bootloader
+        unsigned char* bootloader = (unsigned char*) malloc(BOOTLOADER_SIZE);
+
+        //Read bootloader
+        int bytesread = fread(bootloader, 1, BOOTLOADER_SIZE, inputfile);
+        if(bytesread != BOOTLOADER_SIZE)
+        {
+            //Free memory
+            free(bootloader);
+
+            status.errorcode = ERROR_IMAGE_INCOMPLETE;
+            return status;
+        }
+
+        //Inspect the EDC of the four form 2 sectors in the bootloader
+        unsigned int form2sectorsinbootloader[] = {12, 13, 14, 15};
+        for(int i = 0; i < sizeof(form2sectorsinbootloader) / sizeof(form2sectorsinbootloader[0]); ++i)
+        {
+            //Navigate to the current sector
+            unsigned char* sector = bootloader + form2sectorsinbootloader[i] * SECTOR_SIZE;
+
+            //Extract EDC
+            unsigned int EDC = (sector[CDROMXA_FORM2_EDC_OFFSET + 0] << 0)
+                             | (sector[CDROMXA_FORM2_EDC_OFFSET + 1] << 8)
+                             | (sector[CDROMXA_FORM2_EDC_OFFSET + 2] << 16)
+                             | (sector[CDROMXA_FORM2_EDC_OFFSET + 3] << 24);
+
+            //Check if EDC is set and increment corresponding counters
+            if(EDC == 0x00000000)
+            {
+                ++status.form2bootsectorswithoutedc;
+            }
+            else
+            {
+                ++status.form2bootsectorswithedc;
+            }
+        }
+
+        //Change the EDC mode appropriately
+        if(status.form2bootsectorswithoutedc >= status.form2bootsectorswithedc)
+        {
+            form2EDCMode = ZERO;
+        }
+        else
+        {
+            form2EDCMode = COMPUTE;
+        }
+
+        //Free memory
+        free(bootloader);
+
+        //Reset input file position (the bootloader must be fixed as well)
+        fseek(inputfile, 0, SEEK_SET);
+    }
+
     //Iterate over all sectors in the input file, fix them, and write
-    unsigned char minutes = 0x00;
-    unsigned char seconds = 0x02;
-    unsigned char blocks  = 0x00;
-    unsigned char* sector = (unsigned char*) malloc(SECTOR_SIZE);
+    unsigned char  minutes = 0x00;
+    unsigned char  seconds = 0x02;
+    unsigned char  blocks  = 0x00;
+    unsigned char* sector  = (unsigned char*) malloc(SECTOR_SIZE);
     if(sector == NULL)
     {
-        return ERROR_OUT_OF_MEMORY;
+        status.errorcode = ERROR_OUT_OF_MEMORY;
+        return status;
     }
     for(int i = 0; i < filesize; i += SECTOR_SIZE)
     {
@@ -158,11 +252,14 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
             fclose(inputfile);
             fclose(outputfile);
 
-            return ERROR_IMAGE_INCOMPLETE;
+            status.errorcode = ERROR_IMAGE_INCOMPLETE;
+            return status;
         }
 
         //Find mode
         unsigned char mode = sector[HEADER_OFFSET + 3];
+
+        //Process sector based on mode
         if(mode == MODE_0)
         {
             //Check that the sector is really all-zero
@@ -177,7 +274,8 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
                     fclose(inputfile);
                     fclose(outputfile);
 
-                    return ERROR_MODE0_IS_NOT_0;
+                    status.errorcode = ERROR_MODE0_IS_NOT_0;
+                    return status;
                 }
             }
 
@@ -198,7 +296,8 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
                 fclose(inputfile);
                 fclose(outputfile);
 
-                return ERROR_OUT_OF_MEMORY;
+                status.errorcode = ERROR_OUT_OF_MEMORY;
+                return status;
             }
 
             for(int j = i + SECTOR_SIZE; j < filesize && remainder_is_zero; j += SECTOR_SIZE)
@@ -215,7 +314,8 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
                     fclose(inputfile);
                     fclose(outputfile);
 
-                    return ERROR_IMAGE_INCOMPLETE;
+                    status.errorcode = ERROR_IMAGE_INCOMPLETE;
+                    return status;
                 }
 
                 //Check that the sector is all-zero
@@ -233,7 +333,7 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
             if(remainder_is_zero)
             {
                 //We had indeed reached the beginning of the zero-padding. We are done here!
-                return 0;
+                return status;
             }
             else
             {
@@ -253,6 +353,9 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
                 sector[HEADER_OFFSET + 1] = seconds;
                 sector[HEADER_OFFSET + 2] = blocks;
                 sector[HEADER_OFFSET + 3] = mode;
+
+                //Update sector mode count
+                ++status.mode0sectors;
             }
         }
         else if(mode == MODE_1)
@@ -264,7 +367,8 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
             fclose(inputfile);
             fclose(outputfile);
 
-            return ERROR_UNSUPPORTED_MODE;
+            status.errorcode = ERROR_UNSUPPORTED_MODE;
+            return status;
         }
         else if(mode == MODE_2)
         {
@@ -291,7 +395,8 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
                 fclose(inputfile);
                 fclose(outputfile);
 
-                return ERROR_SUBHEADER_DAMAGED;
+                status.errorcode = ERROR_SUBHEADER_DAMAGED;
+                return status;
             }
 
             //Determine CD ROM XA Mode 2 form
@@ -300,7 +405,10 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
             //Compute and write EDC
             if(isForm2)
             {
-                //printf("Encountered form 2 sector @ 0x%08X\n", i);
+                if(verbose)
+                {
+                    printf("Encountered form 2 sector @ 0x%08X\n", i);
+                }
 
                 //Write header
                 sector[HEADER_OFFSET + 0] = minutes;
@@ -308,22 +416,41 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
                 sector[HEADER_OFFSET + 2] = blocks;
                 sector[HEADER_OFFSET + 3] = mode;
 
-                //Compute form 2 EDC
-                unsigned int EDC = 0x00000000;
-                if(writeForm2EDC)
+                //Handle form 2 EDC
+                unsigned int EDC; //For some strange reason, a declaration in case COMPUTE would require a ; in front.
+                switch(form2EDCMode)
                 {
-                    for(int i = CDROMXA_SUBHEADER_OFFSET; i < CDROMXA_FORM2_EDC_OFFSET; ++i)
-                    {
-                        EDC = EDC ^ sector[i];
-                        EDC = (EDC >> 8) ^ EDCTable[EDC & 0x000000FF];
-                    }
+                    case KEEP:
+                        //Leave the original in tact. Nothing to do here.
+                        break;
+
+                    case COMPUTE:
+                        //Compute form 2 EDC
+                        EDC = 0x00000000;
+                        for(int i = CDROMXA_SUBHEADER_OFFSET; i < CDROMXA_FORM2_EDC_OFFSET; ++i)
+                        {
+                            EDC = EDC ^ sector[i];
+                            EDC = (EDC >> 8) ^ EDCTable[EDC & 0x000000FF];
+                        }
+
+                        //Write EDC
+                        sector[CDROMXA_FORM2_EDC_OFFSET + 0] = (EDC & 0x000000FF) >> 0;
+                        sector[CDROMXA_FORM2_EDC_OFFSET + 1] = (EDC & 0x0000FF00) >> 8;
+                        sector[CDROMXA_FORM2_EDC_OFFSET + 2] = (EDC & 0x00FF0000) >> 16;
+                        sector[CDROMXA_FORM2_EDC_OFFSET + 3] = (EDC & 0xFF000000) >> 24;
+                        break;
+
+                    case ZERO:
+                        //Write zeroed EDC
+                        sector[CDROMXA_FORM2_EDC_OFFSET + 0] = 0;
+                        sector[CDROMXA_FORM2_EDC_OFFSET + 1] = 0;
+                        sector[CDROMXA_FORM2_EDC_OFFSET + 2] = 0;
+                        sector[CDROMXA_FORM2_EDC_OFFSET + 3] = 0;
+                        break;
                 }
 
-                //Write EDC
-                sector[CDROMXA_FORM2_EDC_OFFSET + 0] = (EDC & 0x000000FF) >> 0;
-                sector[CDROMXA_FORM2_EDC_OFFSET + 1] = (EDC & 0x0000FF00) >> 8;
-                sector[CDROMXA_FORM2_EDC_OFFSET + 2] = (EDC & 0x00FF0000) >> 16;
-                sector[CDROMXA_FORM2_EDC_OFFSET + 3] = (EDC & 0xFF000000) >> 24;
+                //Update sector mode count
+                ++status.mode2form2sectors;
             }
             else
             {
@@ -340,11 +467,7 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
                 sector[CDROMXA_FORM1_EDC_OFFSET + 1] = (EDC & 0x0000FF00) >> 8;
                 sector[CDROMXA_FORM1_EDC_OFFSET + 2] = (EDC & 0x00FF0000) >> 16;
                 sector[CDROMXA_FORM1_EDC_OFFSET + 3] = (EDC & 0xFF000000) >> 24;
-            }
 
-
-            if(!isForm2)
-            {
                 //Write error-correction data
 
                 //Temporarily clear header
@@ -413,6 +536,9 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
                 sector[HEADER_OFFSET + 1] = seconds;
                 sector[HEADER_OFFSET + 2] = blocks;
                 sector[HEADER_OFFSET + 3] = mode;
+
+                //Update sector mode count
+                ++status.mode2form1sectors;
             }
         }
         else
@@ -424,10 +550,11 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
             fclose(inputfile);
             fclose(outputfile);
 
-            return ERROR_UNEXPECTED_MODE;
+            status.errorcode = ERROR_UNEXPECTED_MODE;
+            return status;
         }
 
-        //Write to file
+        //Write fixed sector to output file
         int byteswritten = fwrite(sector, 1, SECTOR_SIZE, outputfile);
         if(byteswritten != SECTOR_SIZE)
         {
@@ -438,7 +565,8 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
             fclose(inputfile);
             fclose(outputfile);
 
-            return ERROR_OUTPUT_IO_ERROR;
+            status.errorcode = ERROR_OUTPUT_IO_ERROR;
+            return status;
         }
 
         //Update position
@@ -480,105 +608,162 @@ int fixImage(char* inputfilepath, char* outputfilepath, bool writeForm2EDC)
     fclose(inputfile);
     fclose(outputfile);
 
-    //Signal successful operation
-    return 0;
+    //Signal successful operation and return status
+    return status;
 }
+
+
+
 
 int main(int argc, char* argv[])
 {
-    bool usage_correct = true;
-    bool writeForm2EDC = true;
-    char* inputfile;
-    char* outputfile;
+    enum EDCMode form2EDCMode  = INFER;
+    bool         verbose       = false;
+    char*        inputfile     = NULL;
+    char*        outputfile    = NULL;
 
     //Verify parameters
-    if(argc < 3 || argc > 4)
+    for(int i = 1; i < argc; ++i)
     {
-        usage_correct = false;
-    }
-    else
-    {
-        if(argc == 4)
+        if(strcmp(argv[i], "-inferedc") == 0)
         {
-            if(strcmp(argv[1], "-noedc") == 0)
-            {
-                writeForm2EDC = false;
-                inputfile  = argv[2];
-                outputfile = argv[3];
-            }
-            else
-            {
-                usage_correct = false;
-            }
+            form2EDCMode = INFER;
+        }
+        else if(strcmp(argv[i], "-edc") == 0)
+        {
+            form2EDCMode = COMPUTE;
+        }
+        else if(strcmp(argv[i], "-noedc") == 0)
+        {
+            form2EDCMode = ZERO;
+        }
+        else if(strcmp(argv[i], "-keepedc") == 0)
+        {
+            form2EDCMode = KEEP;
+        }
+        else if(strcmp(argv[i], "-verbose") == 0)
+        {
+            verbose = true;
         }
         else
         {
-            inputfile  = argv[1];
-            outputfile = argv[2];
+            if(inputfile == NULL)
+            {
+                inputfile = argv[i];
+            }
+            else if(outputfile == NULL)
+            {
+                outputfile = argv[i];
+            }
+            else
+            {
+                printf("Unexpected parameter will be ignored: %s\n", argv[i]);
+            }
         }
     }
 
-    if(!usage_correct)
+    if(inputfile == NULL || outputfile == NULL)
     {
         //If usage is not correct, display usage message and exit
         printf("This program will fix a CD image extracted from a PS1 classic download to make  ");
         printf("it mountable with a program like Daemon Tools and playable in PS1 emulators     ");
         printf("other than ePSXe. Usage:                                                        ");
         printf("                                                                                ");
-        printf("isofix [-noedc] inputfile outputfile                                            ");
+        printf("isofix [-edc | -noedc] inputfile outputfile                                     ");
+        printf("                                                                                ");
+        printf("  -inferedc If specified, isofix will infer whether to write the optional EDC   ");
+        printf("            at the end of mode 2 form 2 sectors based on the presence of EDCs in");
+        printf("            the bootloader of the input image. This is the default behaviour and");
+        printf("            seems to result in exact copies of the original discs.              ");
+        printf("                                                                                ");
+        printf("  -edc      If specified, isofix will write the optional EDC at the end of mode ");
+        printf("            2 form 2 sectors.                                                   ");
         printf("                                                                                ");
         printf("  -noedc    If specified, isofix will not write the optional EDC at the end of  ");
-        printf("            mode 2 form 2 sectors, but replace it with zeroes. Whether this EDC ");
-        printf("            is present on the original disc differs from game to game.          ");
+        printf("            mode 2 form 2 sectors, but replace it with zeroes.                  ");
+        printf("                                                                                ");
+        printf("  -keepedc  If specified, isofix will keep the optional EDC data for mode 2 form");
+        printf("            form 2 sectors that is present in the input image. Not recommended. ");
+        printf("                                                                                ");
+        printf("  -verbose  If specified, isofix will print extra debugging information about   ");
+        printf("            the encountered sector modes and forms.                             ");
         printf("                                                                                ");
         printf("Copyright 2014 by Daniel Huguenin                                               ");
         return 0;
     }
 
     //Usage is correct - fix the given image
-    if(!writeForm2EDC)
+    switch(form2EDCMode)
     {
-        printf("Writing of optional EDC for mode 2 form 2 sectors disabled!\n");
+        case INFER:
+            printf("Whether or not to write EDCs will be inferred from the bootloader.\n");
+            break;
+        case KEEP:
+            printf("Original EDCs are kept.\n");
+            break;
+        case COMPUTE:
+            printf("Optional EDCs for mode 2 form 2 sectors will be computed and written.\n");
+            break;
+        case ZERO:
+            printf("Optional EDCs for mode 2 form 2 sectors will be zeroed.\n");
+            break;
     }
     printf("Fixing image...\n");
-    int errorcode = fixImage(inputfile, outputfile, writeForm2EDC);
+    struct fixImageStatus status = fixImage(inputfile, outputfile, form2EDCMode, verbose);
 
-    switch(errorcode)
+    switch(status.errorcode)
     {
         //Print success message
         case 0:
             printf("The image has been fixed!\n");
+            if(verbose)
+            {
+                printf("Number of mode 0 sectors:               %i\n", status.mode0sectors);
+                printf("Number of mode 1 sectors:               Mode 1 sectors are not supported.\n");
+                printf("Number of mode 2 form 1 sectors:        %i\n", status.mode2form1sectors);
+                printf("Number of mode 2 form 2 sectors:        %i\n", status.mode2form2sectors);
+                printf("Mode 2 form 2 boot sectors with EDC:    %i\n", status.form2bootsectorswithedc);
+                printf("Mode 2 form 2 boot sectors without EDC: %i\n", status.form2bootsectorswithoutedc);
+            }
             break;
 
         //Print an error message
         case ERROR_OUT_OF_MEMORY:
-            printf("Out of memory!");
+            printf("Out of memory!\n");
             break;
+
         case ERROR_INPUT_IO_ERROR:
             printf("Could not open input file - terminating\n");
             break;
+
         case ERROR_OUTPUT_IO_ERROR:
             printf("Could not write to output file - terminating\n");
             break;
+
         case ERROR_IMAGE_INCOMPLETE:
-            printf("Image ended prematurely! The image file you provided contains an incomplete sector.");
+            printf("Image ended prematurely! The image file you provided contains an incomplete sector.\n");
             break;
+
         case ERROR_UNEXPECTED_MODE:
             printf("Encountered unknown mode! This is probably not a proper image.\n");
             break;
+
         case ERROR_UNSUPPORTED_MODE:
             printf("Mode 1 sector encountered. This program does not support such images.\n");
             break;
+
         case ERROR_SUBHEADER_DAMAGED:
             printf("Encountered inconsistent subheader!\n");
             break;
+
         case ERROR_MODE0_IS_NOT_0:
-            printf("Encountered a mode 0 sector that contained non-null data. This image is corrupt!");
+            printf("Encountered a mode 0 sector that contained non-null data. This image is corrupt!\n");
             break;
+
         default:
-            printf("Encountered unknown error: %i", errorcode);
+            printf("Encountered unknown error: %i\n", status.errorcode);
             break;
     }
 
-    return errorcode;
+    return status.errorcode;
 }
