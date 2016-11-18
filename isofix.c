@@ -5,7 +5,7 @@
 
 //Crappy Visual Studio compatibility
 #ifdef _MSC_VER
-#define snprintf _snprintf
+    #define snprintf _snprintf
 #endif
 
 //Position and size of individual elements in a CD sector
