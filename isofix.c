@@ -3,6 +3,11 @@
 #include <stdbool.h>
 #include <string.h>
 
+//Crappy Visual Studio compatibility
+#ifdef _MSC_VER
+#define snprintf _snprintf
+#endif
+
 //Position and size of individual elements in a CD sector
 #define SECTOR_SIZE                    2352
 #define BOOTLOADER_SECTORS             16
@@ -107,7 +112,7 @@ unsigned short RSPCTable[43][256] =
 #define ERROR_IMAGE_INCOMPLETE  4
 #define ERROR_UNEXPECTED_MODE   5
 #define ERROR_UNSUPPORTED_MODE  6
-#define ERROR_SUBHEADER_DAMAGED 7
+#define ERROR_SUBHEADER_DAMAGED 7 //No longer used
 #define ERROR_MODE0_IS_NOT_0    8
 
 enum EDCMode
@@ -120,14 +125,23 @@ enum EDCMode
 
 struct fixImageStatus
 {
-    int  errorcode;
-    int  mode0sectors;
-    int  mode1sectors;
-    int  mode2form1sectors;
-    int  mode2form2sectors;
-    int  form2bootsectorswithedc;
-    int  form2bootsectorswithoutedc;
+    int errorcode;
+    int mode0sectors;
+    int mode1sectors;
+    int mode2form1sectors;
+    int mode2form2sectors;
+    int form2bootsectorswithedc;
+    int form2bootsectorswithoutedc;
+    char** warnings;
+    unsigned int warningscount;
 };
+
+#define addWarning(status, formatString, maxLength, ...) \
+++status.warningscount;\
+status.warnings = realloc(status.warnings, sizeof(status.warnings) * status.warningscount);\
+char* warningString = malloc(maxLength);\
+snprintf(warningString, maxLength, formatString, __VA_ARGS__);\
+status.warnings[status.warningscount - 1] = warningString;\
 
 struct fixImageStatus fixImage(char* inputfilepath, char* outputfilepath, enum EDCMode form2EDCMode, bool verbose)
 {
@@ -140,6 +154,8 @@ struct fixImageStatus fixImage(char* inputfilepath, char* outputfilepath, enum E
     status.mode2form2sectors          = 0;
     status.form2bootsectorswithedc    = 0;
     status.form2bootsectorswithoutedc = 0;
+    status.warnings                   = NULL;
+    status.warningscount              = 0;
 
     //Sync pattern
     unsigned char sync[SYNC_SIZE] = {0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00};
@@ -386,17 +402,21 @@ struct fixImageStatus fixImage(char* inputfilepath, char* outputfilepath, enum E
             unsigned char datatypecopy      = sector[CDROMXA_SUBHEADER_OFFSET + 7];
 
             //Check that the two copies of the subheader data are equivalent
-            if(filenumber != filenumbercopy || channelnumber != channelnumbercopy || submode != submodecopy || datatype != datatypecopy)
+            if(filenumber != filenumbercopy)
             {
-                //Free memory
-                free(sector);
-
-                //Close the input and output files
-                fclose(inputfile);
-                fclose(outputfile);
-
-                status.errorcode = ERROR_SUBHEADER_DAMAGED;
-                return status;
+                addWarning(status, "Corrupt CD-ROM XA subheader will be copied to the output file. File number mismatch at %02X:%02X:%02X: 0x%02X vs 0x%02X", 255, minutes, seconds, blocks, filenumber, filenumbercopy);
+            }
+            if(channelnumber != channelnumbercopy)
+            {
+                addWarning(status, "Corrupt CD-ROM XA subheader will be copied to the output file. Channel number mismatch at %02X:%02X:%02X: 0x%02X vs 0x%02X", 255, minutes, seconds, blocks, channelnumber, channelnumbercopy);
+            }
+            if(submode != submodecopy)
+            {
+                addWarning(status, "Corrupt CD-ROM XA subheader will be copied to the output file. Submode mismatch at %02X:%02X:%02X: 0x%02X vs 0x%02X", 255, minutes, seconds, blocks, submode, submodecopy);
+            }
+            if(datatype != datatypecopy)
+            {
+                addWarning(status, "Corrupt CD-ROM XA subheader will be copied to the output file. CD-ROM XA subheader corrupt. Data type mismatch at %02X:%02X:%02X: 0x%02X vs 0x%02X", 255, minutes, seconds, blocks, datatype, datatypecopy);
             }
 
             //Determine CD ROM XA Mode 2 form
@@ -752,10 +772,6 @@ int main(int argc, char* argv[])
             printf("Mode 1 sector encountered. This program does not support such images.\n");
             break;
 
-        case ERROR_SUBHEADER_DAMAGED:
-            printf("Encountered inconsistent subheader!\n");
-            break;
-
         case ERROR_MODE0_IS_NOT_0:
             printf("Encountered a mode 0 sector that contained non-null data. This image is corrupt!\n");
             break;
@@ -763,6 +779,16 @@ int main(int argc, char* argv[])
         default:
             printf("Encountered unknown error: %i\n", status.errorcode);
             break;
+    }
+
+    if(status.warningscount > 0)
+    {
+        printf("The following warnings occured during the process:\n");
+        for(int i = 0; i < status.warningscount; ++i)
+        {
+            printf(status.warnings[i]);
+            printf("\n");
+        }
     }
 
     return status.errorcode;
